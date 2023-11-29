@@ -1,6 +1,6 @@
 use unique_type_id::UniqueTypeId;
 
-use crate::BusWidth;
+use crate::bus;
 
 use super::{
     Column, ComponentId, {any_as_bytes, any_from_bytes, ComponentStorage, RowIndex},
@@ -15,7 +15,7 @@ pub trait StorageAccessor<'a>: 'a {
 fortuples! {
     impl<'a> StorageAccessor<'a> for (#(&'a mut #Member),*)
     where
-        #(#Member: UniqueTypeId<BusWidth> + 'static),*
+        #(#Member: UniqueTypeId<bus::Width> + 'static),*
     {
 	#[allow(clippy::unused_unit)]
 	fn access(storage: &'a mut ComponentStorage, row: RowIndex) -> (#(&'a mut #Member),*) {
@@ -39,7 +39,7 @@ pub trait ComponentSet {
 fortuples! {
     impl ComponentSet for #Tuple
     where
-        #(#Member: UniqueTypeId<BusWidth> + 'static),*
+        #(#Member: UniqueTypeId<bus::Width> + 'static),*
     {
 	fn components() -> impl Iterator<Item = ComponentId> {
 	    [#(#Member::id()),*].into_iter()
@@ -65,7 +65,7 @@ pub trait ReduceArgument {
 fortuples! {
     impl ReduceArgument for #Tuple
     where
-        #(#Member: UniqueTypeId<BusWidth> + 'static),*
+        #(#Member: UniqueTypeId<bus::Width> + 'static),*
     {	
 	#[allow(clippy::unused_unit)]
 	unsafe fn build(storage: &mut ComponentStorage, row: RowIndex) -> Self {
@@ -87,7 +87,7 @@ pub trait StorageInsert {
 fortuples! {
     impl StorageInsert for #Tuple
     where
-        #(#Member: UniqueTypeId<BusWidth> + 'static),*
+        #(#Member: UniqueTypeId<bus::Width> + 'static),*
     {
 	fn get_values(&self) -> impl Iterator<Item = (ComponentId, &[u8])> {
             [#((#Member::id(), any_as_bytes(&#self))),*].into_iter()

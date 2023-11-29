@@ -4,13 +4,78 @@
 
 extern crate alloc;
 
-use core::num::NonZeroU16;
-
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-type BusWidth = u16;
-type NonZeroBusWidth = NonZeroU16;
+#[cfg(any(
+    all(
+        feature = "bus_width_u8",
+        any(
+            feature = "bus_width_ptr",
+            feature = "bus_width_u16",
+            feature = "bus_width_u32",
+            feature = "bus_width_u64"
+        )
+    ),
+    all(
+        feature = "bus_width_u16",
+        any(
+            feature = "bus_width_u8",
+            feature = "bus_width_ptr",
+            feature = "bus_width_u32",
+            feature = "bus_width_u64"
+        )
+    ),
+    all(
+        feature = "bus_width_u32",
+        any(
+            feature = "bus_width_u8",
+            feature = "bus_width_u16",
+            feature = "bus_width_ptr",
+            feature = "bus_width_u64"
+        )
+    ),
+    all(
+        feature = "bus_width_u64",
+        any(
+            feature = "bus_width_u8",
+            feature = "bus_width_u16",
+            feature = "bus_width_u32",
+            feature = "bus_width_ptr"
+        )
+    ),
+))]
+compile_error!("You may only enable one bus width at a time.");
+
+#[cfg(feature = "bus_width_ptr")]
+pub mod bus {
+    pub type Width = usize;
+    pub type NonZero = core::num::NonZeroUsize;
+}
+
+#[cfg(feature = "bus_width_u8")]
+pub mod bus {
+    pub type Width = u8;
+    pub type NonZero = core::num::NonZeroU8;
+}
+
+#[cfg(feature = "bus_width_u16")]
+pub mod bus {
+    pub type Width = u16;
+    pub type NonZero = core::num::NonZeroU16;
+}
+
+#[cfg(feature = "bus_width_u32")]
+pub mod bus {
+    pub type Width = u32;
+    pub type NonZero = core::num::NonZeroU32;
+}
+
+#[cfg(feature = "bus_width_u64")]
+pub mod bus {
+    pub type Width = u64;
+    pub type NonZero = core::num::NonZeroU64;
+}
 
 mod storage;
 use storage::{ComponentSet, ComponentStorage, ReduceArgument, RowIndex, StorageAccessor};
@@ -19,12 +84,12 @@ use unique_type_id::{TypeId, UniqueTypeId};
 use self::storage::{Column, StorageInsert};
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
-pub struct EntityId(NonZeroBusWidth);
+pub struct EntityId(bus::NonZero);
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
-struct ArcheTypeId(BusWidth);
+struct ArcheTypeId(bus::Width);
 
-type ComponentId = TypeId<BusWidth>;
+type ComponentId = TypeId<bus::Width>;
 
 const EMPTY_ARCHE_TYPE_ID: ArcheTypeId = ArcheTypeId(0);
 
@@ -118,7 +183,7 @@ impl<'a> EntityAccess<'a> {
                     // Spawning an empty column that is then instantly dropped (like in the case of reducing) is practically a free operation.
                     let new_arche_type = arche_mod(current_arche_type, component_id, column);
 
-                    let new_arche_type_id = ArcheTypeId(self.arche_types.len() as BusWidth);
+                    let new_arche_type_id = ArcheTypeId(self.arche_types.len() as bus::Width);
                     self.arche_types.push(new_arche_type);
                     self.arche_type_lookup
                         .insert(components_key, new_arche_type_id);
@@ -224,7 +289,7 @@ impl<'a> EntityAccess<'a> {
 
     pub fn has_component<T>(&self) -> bool
     where
-        T: UniqueTypeId<BusWidth>,
+        T: UniqueTypeId<bus::Width>,
     {
         let arche_type = self.arche_type();
 
@@ -248,7 +313,7 @@ struct EntityRecord {
 
 pub struct World {
     entities: HashMap<EntityId, EntityRecord>,
-    next_entity_id: u16,
+    next_entity_id: bus::Width,
     arche_types: Vec<ArcheType>,
     arche_type_lookup: HashMap<Vec<ComponentId>, ArcheTypeId>,
 }
@@ -275,7 +340,7 @@ impl World {
         let entity_id = self.next_entity_id;
         self.next_entity_id += 1;
 
-        EntityId(NonZeroBusWidth::new(entity_id).expect("Next entity ID was zero."))
+        EntityId(bus::NonZero::new(entity_id).expect("Next entity ID was zero."))
     }
 
     pub fn create_empty_entity(&mut self) -> EntityId {
@@ -354,12 +419,12 @@ mod test {
 
         #[derive(UniqueTypeId)]
         #[UniqueTypeIdFile = "testing_types.toml"]
-        #[UniqueTypeIdType = "BusWidth"]
+        #[UniqueTypeIdType = "bus::Width"]
         struct A(i32);
 
         #[derive(UniqueTypeId)]
         #[UniqueTypeIdFile = "testing_types.toml"]
-        #[UniqueTypeIdType = "BusWidth"]
+        #[UniqueTypeIdType = "bus::Width"]
         struct B(f32);
 
         let component_id_a: ComponentId = A::id();
@@ -460,7 +525,7 @@ mod test {
     fn component_id_size() {
         assert_eq!(
             core::mem::size_of::<ComponentId>(),
-            core::mem::size_of::<BusWidth>()
+            core::mem::size_of::<bus::Width>()
         );
     }
 }

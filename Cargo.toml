@@ -3,6 +3,15 @@ name = "micro_ecs"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["bus_width_ptr"]
+
+bus_width_ptr = []
+bus_width_u8 = []
+bus_width_u16 = []
+bus_width_u32 = []
+bus_width_u64 = []
+
 [patch.crates-io]
 unique-type-id = { git = "https://github.com/IamTheCarl/unique-type-id.git" }
 

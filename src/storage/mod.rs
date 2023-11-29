@@ -9,7 +9,7 @@ use alloc::alloc::handle_alloc_error;
 use hashbrown::{HashMap, HashSet};
 use unique_type_id::UniqueTypeId;
 
-use super::{BusWidth, ComponentId};
+use super::{bus, ComponentId};
 
 fn any_as_bytes<T: Sized>(any: &T) -> &[u8] {
     // Safety: Since we are only reading data, this can't leave the struct in a bad state.
@@ -32,7 +32,7 @@ unsafe fn any_from_bytes<T: Sized>(bytes: &[u8]) -> T {
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
-pub struct RowIndex(BusWidth);
+pub struct RowIndex(bus::Width);
 
 struct ColumnAllocation {
     data: NonNull<u8>,
@@ -448,7 +448,7 @@ impl ComponentStorage {
 
     pub fn contains_component<T>(&self) -> bool
     where
-        T: UniqueTypeId<BusWidth>,
+        T: UniqueTypeId<bus::Width>,
     {
         self.components.contains_key(&T::id())
     }
