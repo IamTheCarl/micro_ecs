@@ -1,0 +1,14 @@
+[package]
+name = "micro_ecs"
+version = "0.1.0"
+edition = "2021"
+
+[patch.crates-io]
+unique-type-id = { git = "https://github.com/IamTheCarl/unique-type-id.git" }
+
+[dependencies]
+hashbrown = "0.14.2"
+casey = "0.4.0"
+fortuples = "0.9.1"
+unique-type-id = "1.2.0"
+unique-type-id-derive = "1.2.0"
