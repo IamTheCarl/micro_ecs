@@ -4,9 +4,6 @@ version = "0.1.0"
 authors = ["James Carl"]
 edition = "2021"
 
-[patch.crates-io]
-unique-type-id = { git = "https://github.com/IamTheCarl/unique-type-id.git" }
-
 [dependencies]
 agb = "0.18.0"
 micro_ecs = { path = "../.." }

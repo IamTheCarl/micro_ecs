@@ -9,6 +9,7 @@ use core::{
 
 use alloc::alloc::handle_alloc_error;
 use hashbrown::{HashMap, HashSet};
+use uninit::out_ref::Out;
 use unique_type_id::UniqueTypeId;
 
 use super::{bus, ComponentId};
@@ -107,7 +108,9 @@ impl Column {
             .data
             .as_ptr()
             .add(element_length * index.0 as usize);
-        let slice = core::slice::from_raw_parts_mut(pointer, element_length);
+
+        // It is unsafe to construct a slice from a possibly uninitalized array, so we're going to assume it is uninitalized.
+        let slice = Out::slice_from_raw_parts(pointer, element_length);
 
         slice.copy_from_slice(element);
     }
