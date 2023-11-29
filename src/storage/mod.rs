@@ -1,3 +1,5 @@
+//! The components have to be stored somewhere, and this is it.
+
 use core::{
     alloc::Layout,
     mem,
@@ -34,12 +36,16 @@ unsafe fn any_from_bytes<T: Sized>(bytes: &[u8]) -> T {
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub struct RowIndex(bus::Width);
 
+/// Represents the allocation of memory for a column.
 struct ColumnAllocation {
     data: NonNull<u8>,
     layout: Layout,
 }
 
-pub struct Column {
+/// A column of components in a ComponentTable.
+/// This is a very low level structure. While it will handle allocating the memory for its type, it is
+/// the job of the ComponentTable itself to track how many rows are allocated in its columns.
+struct Column {
     // TODO we want to support using a per-component allocator.
     allocation: Option<ColumnAllocation>,
     element_layout: Layout,
@@ -47,6 +53,7 @@ pub struct Column {
 }
 
 impl Column {
+    /// Create a column that can store this specific type.
     pub fn new<T: 'static>() -> Self {
         fn deconstructor<T>(data: &[u8]) {
             let pointer = data as *const _ as *const T;
@@ -66,6 +73,7 @@ impl Column {
         }
     }
 
+    /// Create a new column that can store the same type as the other column.
     fn inherit_type(other: &Self) -> Self {
         Self {
             allocation: None,
@@ -79,6 +87,8 @@ impl Column {
     unsafe fn read_element(&self, index: RowIndex) -> &[u8] {
         let allocation = self.allocation.as_ref().unwrap();
         let element_length = self.element_layout.size();
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let pointer = allocation
             .data
             .as_ptr()
@@ -91,6 +101,8 @@ impl Column {
     unsafe fn set_element(&mut self, index: RowIndex, element: &[u8]) {
         let allocation = self.allocation.as_mut().unwrap();
         let element_length = self.element_layout.size();
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let pointer = allocation
             .data
             .as_ptr()
@@ -100,12 +112,15 @@ impl Column {
         slice.copy_from_slice(element);
     }
 
+    /// Access a row of the column.
     /// # Safety
     /// Must be in range of the column rows.
     /// You must not read from rows that have been dropped or have not yet been initalized.
     unsafe fn access_element_mut(&mut self, index: RowIndex) -> &mut [u8] {
         let allocation = self.allocation.as_mut().unwrap();
         let element_length = self.element_layout.size();
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let pointer = allocation
             .data
             .as_ptr()
@@ -113,6 +128,8 @@ impl Column {
         core::slice::from_raw_parts_mut(pointer, element_length)
     }
 
+    /// Resize the column to the select number of elements.
+    /// You can safely shrink the column, but elements from those freed rows will not be properly dropped.
     fn resize(&mut self, new_size: NonZeroUsize) {
         let element_length = self.element_layout.size();
 
@@ -228,7 +245,9 @@ const fn padding_needed_for(layout: &Layout, align: usize) -> usize {
 
 const INITIAL_ROW_ALLOCATION: usize = 4;
 
-pub struct ComponentStorage {
+/// A table of components. Each row represents an entity, and each column is dedicated to a specific
+/// type of component.
+pub struct ComponentTable {
     // TODO the column should be able to allocate on different heaps.
     components: HashMap<ComponentId, Column>,
     free_rows: HashSet<RowIndex>,
@@ -236,7 +255,8 @@ pub struct ComponentStorage {
     allocated_rows: usize,
 }
 
-impl ComponentStorage {
+impl ComponentTable {
+    /// Create a new, empty table without any kind of storage.
     pub fn empty_type() -> Self {
         Self {
             components: HashMap::new(),
@@ -246,14 +266,17 @@ impl ComponentStorage {
         }
     }
 
-    /// Create a new storage that can store the components of this one but with storage for component T added.
-    pub fn extend(&self, component_id: ComponentId, column: Column) -> Self {
+    /// Create a new storage that can store the components of this one but with storage for a paticular component added.
+    pub fn extend(&self, column_construction: ColumnConstruction) -> Self {
         Self {
             components: self
                 .components
                 .iter()
                 .map(|(component_id, column)| (*component_id, Column::inherit_type(column)))
-                .chain(core::iter::once((component_id, column)))
+                .chain(core::iter::once((
+                    column_construction.0,
+                    column_construction.1,
+                )))
                 .collect(),
             free_rows: HashSet::new(),
             next_row: RowIndex(0),
@@ -300,10 +323,11 @@ impl ComponentStorage {
         row
     }
 
-    /// You must provide all components for all coumns. Missing any will leave the
-    /// leave some columns short.
+    /// Insert a row of columns.
+    /// Having too many components will be ignored. Not having enough will cause a panic.
     /// # Safety
-    /// You must make sure the value you are copying bytes from do not get dropped after insertion.
+    /// You must make sure the value you are copying bytes from do not get dropped after insertion. This will be taking ownership of it.
+    /// The bytes of the component must be from the component associated with the component ID.
     unsafe fn insert_row_raw<'a>(
         &mut self,
         components: impl IntoIterator<Item = (ComponentId, &'a [u8])>,
@@ -331,6 +355,8 @@ impl ComponentStorage {
             let next_row = self.next_row;
             self.next_row.0 += 1;
 
+            // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+            #[allow(clippy::unnecessary_cast)]
             // We may need to allocate more memory.
             let need_to_allocate = next_row.0 as usize >= self.allocated_rows;
 
@@ -366,6 +392,7 @@ impl ComponentStorage {
         }
     }
 
+    /// Remove a row from this table and insert it into another, adding the additionally provided components.
     pub fn extend_row_to_other<T: StorageInsert>(
         &mut self,
         other: &mut Self,
@@ -384,6 +411,8 @@ impl ComponentStorage {
         new_row
     }
 
+    /// Remove a row from this table and insert it into another, removing any components that cannot fit into the other table and returning
+    /// them from this function. Will panic if you try to remove a component that does not exist in this table.
     pub fn reduce_row_to_other<T: ReduceArgument + ComponentSet>(
         &mut self,
         other: &mut Self,
@@ -405,17 +434,19 @@ impl ComponentStorage {
         (new_row, removed_components)
     }
 
-    fn is_row_initalized(&self, row: RowIndex) -> bool {
+    /// Verify that a row is contained in this table and initalized.
+    fn is_row_safe(&self, row: RowIndex) -> bool {
         row.0 < self.next_row.0 || !self.free_rows.contains(&row)
     }
 
+    /// Gives mutable access to the raw bytes of the components in this table.
     fn access_row_raw<const N: usize>(
         &mut self,
         row: RowIndex,
         components: [ComponentId; N],
     ) -> [&mut [u8]; N] {
         // Check that the row is in the allocated range and not freed.
-        if self.is_row_initalized(row) {
+        if self.is_row_safe(row) {
             let mut component_references_iter = components.iter();
 
             let component_references: [&ComponentId; N] =
@@ -435,6 +466,7 @@ impl ComponentStorage {
         }
     }
 
+    /// Access the components of this table.
     pub fn access_row<'a, A>(&'a mut self, row: RowIndex) -> A
     where
         A: StorageAccessor<'a>,
@@ -442,10 +474,12 @@ impl ComponentStorage {
         A::access(self, row)
     }
 
+    /// Iterate the IDs of the components this table stores.
     pub fn iter_component_ids(&self) -> impl Iterator<Item = ComponentId> + '_ {
         self.components.keys().copied()
     }
 
+    /// Return true if this table stores this component.
     pub fn contains_component<T>(&self) -> bool
     where
         T: UniqueTypeId<bus::Width>,
@@ -453,8 +487,9 @@ impl ComponentStorage {
         self.components.contains_key(&T::id())
     }
 
+    /// Iterate over the raw bytes of the components in this table.
     pub fn iter_row(&mut self, row: RowIndex) -> impl Iterator<Item = (ComponentId, &[u8])> {
-        if self.is_row_initalized(row) {
+        if self.is_row_safe(row) {
             self.components
                 .iter_mut()
                 .map(move |(component_id, column)| {
@@ -469,8 +504,9 @@ impl ComponentStorage {
         }
     }
 
+    /// Drop the components stored in this row, freeing their memory.
     pub fn drop_row_and_content(&mut self, row: RowIndex) {
-        if self.is_row_initalized(row) {
+        if self.is_row_safe(row) {
             for column in self.components.values_mut() {
                 // Safety: We have verified above that the row is valid and initalized.
                 unsafe { column.drop_row(row) };
@@ -481,7 +517,7 @@ impl ComponentStorage {
     }
 }
 
-impl Drop for ComponentStorage {
+impl Drop for ComponentTable {
     fn drop(&mut self) {
         // So we need to drop all the values we're storing.
         for column in self.components.values_mut() {

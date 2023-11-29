@@ -9,6 +9,15 @@ use hashbrown::HashMap;
 
 #[cfg(any(
     all(
+        feature = "bus_width_ptr",
+        any(
+            feature = "bus_width_u8",
+            feature = "bus_width_u16",
+            feature = "bus_width_u32",
+            feature = "bus_width_u64"
+        )
+    ),
+    all(
         feature = "bus_width_u8",
         any(
             feature = "bus_width_ptr",
@@ -47,6 +56,11 @@ use hashbrown::HashMap;
 ))]
 compile_error!("You may only enable one bus width at a time.");
 
+/// Many different devices have a different ideal bus width, and it often doesn't match the width of the processor's
+/// pointer register. Because of that, usize is often not ideal.
+/// By using cargo features, you can select `bus_width_ptr` (the default) to use usize as the integer type, but you can
+/// also pick `bus_width_u8`, `bus_width_u16`, `bus_width_u32`, and `bus_width_u64`. Pick whatever is ideal for the memory
+/// configuration of your device.
 #[cfg(feature = "bus_width_ptr")]
 pub mod bus {
     pub type Width = usize;
@@ -78,47 +92,57 @@ pub mod bus {
 }
 
 mod storage;
-use storage::{ComponentSet, ComponentStorage, ReduceArgument, RowIndex, StorageAccessor};
+use storage::{
+    ColumnConstruction, ComponentSet, ComponentTable, ReduceArgument, RowIndex, StorageAccessor,
+};
 use unique_type_id::{TypeId, UniqueTypeId};
 
-use self::storage::{Column, StorageInsert};
+use self::storage::StorageInsert;
 
+/// A reference to an entity stored in our world.
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 pub struct EntityId(bus::NonZero);
 
+/// Used to identify an arche type for an entity.
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
 struct ArcheTypeId(bus::Width);
 
+/// A unique ID for a component, used to find components in tables.
 type ComponentId = TypeId<bus::Width>;
 
+/// The empty arche type, for types that don't contain any components.
 const EMPTY_ARCHE_TYPE_ID: ArcheTypeId = ArcheTypeId(0);
 
+/// Stores components for entities with a specific set of components.
+/// Also stores information needed for the arche type graph, a graph for
+/// quickly looking up other arche types when adding or removing components from an entity.
 struct ArcheType {
-    component_storage: ComponentStorage,
+    component_table: ComponentTable,
     add_component: HashMap<ComponentId, ArcheTypeId>,
     remove_component: HashMap<ComponentId, ArcheTypeId>,
 }
 
 impl ArcheType {
-    /// Create a new arche type that can store the components of this one but with storage for component T added.
-    pub fn extend(&self, component_id: ComponentId, column: Column) -> Self {
+    /// Create a new arche type that can store the components of this one but with additional storage for the listed additional component.
+    pub fn extend(&self, column_construction: ColumnConstruction) -> Self {
         Self {
-            component_storage: self.component_storage.extend(component_id, column),
+            component_table: self.component_table.extend(column_construction),
             add_component: HashMap::new(),
             remove_component: HashMap::new(),
         }
     }
 
-    /// Create a new arche type that can store the components of this one but with storage for component T removed.
+    /// Create a new arche type that can store the components of this one but with the storage for the listed component removed.
     pub fn reduce(&self, component_id: ComponentId) -> Self {
         Self {
-            component_storage: self.component_storage.reduce(component_id),
+            component_table: self.component_table.reduce(component_id),
             add_component: HashMap::new(),
             remove_component: HashMap::new(),
         }
     }
 }
 
+/// Used to efficiently access a single entity.
 pub struct EntityAccess<'a> {
     record: &'a mut EntityRecord,
     arche_types: &'a mut Vec<ArcheType>,
@@ -126,35 +150,53 @@ pub struct EntityAccess<'a> {
 }
 
 impl<'a> EntityAccess<'a> {
+    /// Get the arche type for this entity.
     fn arche_type(&self) -> &ArcheType {
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         self.arche_types
             .get(self.record.arche_type_id.0 as usize)
             .expect("Arche type did not exist.")
     }
 
+    /// Get the arche type for this entity, as a mutable reference.
     fn arche_type_mut(&mut self) -> &mut ArcheType {
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         self.arche_types
             .get_mut(self.record.arche_type_id.0 as usize)
             .expect("Arche type did not exist.")
     }
 
+    /// Find an arche type for a list of components. Returns none if an arche type with storage for this
+    /// component set has not been created.
     fn find_arche_type(&self, components: &[ComponentId]) -> Option<ArcheTypeId> {
         self.arche_type_lookup.get(components).cloned()
     }
 
+    /// Common code for arche type changes. The type of change done is determined by the provided closures.
+    /// * `graph_search` - See if there is a known neghbor in the arche type graph that has the interested component added or removed.
+    /// * `graph_update` - Update the arche type graph to be aware of a new component we just created.
+    /// * `build_component_set` - Create a vec of components from the old arche type, plus or minus the additional listed component.
+    /// * `arche_mod` - We need to create a modified version of the arche type that has had a column added or removed for an arche type.
+    ///                 ColumnConstruction is used to safely construct the column.
     fn arche_type_change<T>(
         &mut self,
         graph_search: impl Fn(&ArcheType, ComponentId) -> Option<ArcheTypeId>,
         graph_update: impl Fn(&mut ArcheType, ComponentId, ArcheTypeId),
         build_component_set: impl Fn(&ArcheType, ComponentId) -> Vec<ComponentId>,
-        arche_mod: impl Fn(&ArcheType, ComponentId, Column) -> ArcheType,
+        arche_mod: impl Fn(&ArcheType, ColumnConstruction) -> ArcheType,
     ) -> ArcheTypeId
     where
         T: ComponentSet,
     {
         let mut previous_arche_type_id = self.record.arche_type_id;
 
-        for (component_id, column) in T::columns() {
+        for column_construction in T::columns() {
+            let component_id = column_construction.component_id();
+
+            // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+            #[allow(clippy::unnecessary_cast)]
             let current_arche_type = self
                 .arche_types
                 .get(previous_arche_type_id.0 as usize)
@@ -181,7 +223,7 @@ impl<'a> EntityAccess<'a> {
 
                     // Columns are spawned empty, meaning they didn't allocate on the heap.
                     // Spawning an empty column that is then instantly dropped (like in the case of reducing) is practically a free operation.
-                    let new_arche_type = arche_mod(current_arche_type, component_id, column);
+                    let new_arche_type = arche_mod(current_arche_type, column_construction);
 
                     let new_arche_type_id = ArcheTypeId(self.arche_types.len() as bus::Width);
                     self.arche_types.push(new_arche_type);
@@ -191,6 +233,8 @@ impl<'a> EntityAccess<'a> {
                     new_arche_type_id
                 };
 
+                // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+                #[allow(clippy::unnecessary_cast)]
                 // Insert it into the graph so we can find it quickly in the future.
                 let previous_arche_type = self
                     .arche_types
@@ -207,6 +251,7 @@ impl<'a> EntityAccess<'a> {
         previous_arche_type_id
     }
 
+    /// Insert one or more components into this entity.
     pub fn insert_components<T>(&mut self, components: T)
     where
         T: ComponentSet + StorageInsert,
@@ -220,12 +265,12 @@ impl<'a> EntityAccess<'a> {
             },
             |old_arche_type, new_component_id| {
                 old_arche_type
-                    .component_storage
+                    .component_table
                     .iter_component_ids()
                     .chain(core::iter::once(new_component_id))
                     .collect()
             },
-            |old_arche_type, component_id, column| old_arche_type.extend(component_id, column),
+            |old_arche_type, column_construction| old_arche_type.extend(column_construction),
         );
 
         let old_arche_type_id = self.record.arche_type_id;
@@ -233,20 +278,23 @@ impl<'a> EntityAccess<'a> {
         if old_arche_type_id != new_arche_type_id {
             self.record.arche_type_id = new_arche_type_id;
 
+            // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+            #[allow(clippy::unnecessary_cast)]
             let [old_arche_type, new_arche_type] = self
                 .arche_types
                 .get_many_mut([old_arche_type_id.0 as usize, new_arche_type_id.0 as usize])
                 .expect("Could not get old and new arche types.");
 
             let old_row = self.record.row;
-            self.record.row = old_arche_type.component_storage.extend_row_to_other(
-                &mut new_arche_type.component_storage,
+            self.record.row = old_arche_type.component_table.extend_row_to_other(
+                &mut new_arche_type.component_table,
                 old_row,
                 components,
             );
         }
     }
 
+    /// Remove one or more components from this entity.
     pub fn remove_components<T>(&mut self) -> T
     where
         T: ReduceArgument + ComponentSet,
@@ -262,17 +310,21 @@ impl<'a> EntityAccess<'a> {
             },
             |old_arche_type, next_component_id| {
                 old_arche_type
-                    .component_storage
+                    .component_table
                     .iter_component_ids()
                     .filter(|iter_id| *iter_id != next_component_id)
                     .collect()
             },
-            |old_arche_type, component_id, _column| old_arche_type.reduce(component_id),
+            |old_arche_type, column_construction| {
+                old_arche_type.reduce(column_construction.component_id())
+            },
         );
 
         let old_arche_type_id = self.record.arche_type_id;
         self.record.arche_type_id = new_arche_type_id;
 
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let [old_arche_type, new_arche_type] = self
             .arche_types
             .get_many_mut([old_arche_type_id.0 as usize, new_arche_type_id.0 as usize])
@@ -280,37 +332,41 @@ impl<'a> EntityAccess<'a> {
 
         let old_row = self.record.row;
         let (new_row, removed_components) = old_arche_type
-            .component_storage
-            .reduce_row_to_other::<T>(&mut new_arche_type.component_storage, old_row);
+            .component_table
+            .reduce_row_to_other::<T>(&mut new_arche_type.component_table, old_row);
 
         self.record.row = new_row;
         removed_components
     }
 
+    /// Return true if the entity contains this component.
     pub fn has_component<T>(&self) -> bool
     where
         T: UniqueTypeId<bus::Width>,
     {
         let arche_type = self.arche_type();
 
-        arche_type.component_storage.contains_component::<T>()
+        arche_type.component_table.contains_component::<T>()
     }
 
+    /// Get a mutable reference to the components of this entity.
     pub fn access_components_mut<'b, A>(&'b mut self) -> A
     where
         A: StorageAccessor<'b>,
     {
         let row = self.record.row;
 
-        self.arche_type_mut().component_storage.access_row(row)
+        self.arche_type_mut().component_table.access_row(row)
     }
 }
 
+/// A record of the arche type of a component and the row in the component table it can be found in.
 struct EntityRecord {
     arche_type_id: ArcheTypeId,
     row: RowIndex,
 }
 
+/// An ECS world that stores all your entities.
 pub struct World {
     entities: HashMap<EntityId, EntityRecord>,
     next_entity_id: bus::Width,
@@ -321,7 +377,7 @@ pub struct World {
 impl Default for World {
     fn default() -> Self {
         let empty_arche_type = ArcheType {
-            component_storage: ComponentStorage::empty_type(),
+            component_table: ComponentTable::empty_type(),
             add_component: HashMap::new(),
             remove_component: HashMap::new(),
         };
@@ -336,6 +392,7 @@ impl Default for World {
 }
 
 impl World {
+    /// Get an entity ID. It needs to be unique and never been used before (just in case someone is holding a reference to the dead entity)
     fn next_entity_id(&mut self) -> EntityId {
         let entity_id = self.next_entity_id;
         self.next_entity_id += 1;
@@ -343,14 +400,17 @@ impl World {
         EntityId(bus::NonZero::new(entity_id).expect("Next entity ID was zero."))
     }
 
+    /// Create a new entity that doesn't have any components stored in it yet.
     pub fn create_empty_entity(&mut self) -> EntityId {
         let entity_id = self.next_entity_id();
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let arche_type = self
             .arche_types
             .get_mut(EMPTY_ARCHE_TYPE_ID.0 as usize)
             .unwrap();
 
-        let row = arche_type.component_storage.insert_row(());
+        let row = arche_type.component_table.insert_row(());
 
         self.entities.insert(
             entity_id,
@@ -363,10 +423,12 @@ impl World {
         entity_id
     }
 
+    /// Returns true if the entity exists.
     pub fn entity_exists(&self, entity_id: EntityId) -> bool {
         self.entities.contains_key(&entity_id)
     }
 
+    /// Access an entity for manipulation. You'll be able to add, remove, and manipulate the components of the entity.
     pub fn access_entity(&mut self, entity_id: EntityId) -> Option<EntityAccess> {
         let record = self.entities.get_mut(&entity_id)?;
 
@@ -379,15 +441,18 @@ impl World {
         Some(access)
     }
 
+    /// Free an entity's memory, including its components.
     pub fn drop_entity(&mut self, entity_id: EntityId) -> bool {
         let record = self.entities.remove(&entity_id);
 
         if let Some(record) = record {
+            // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+            #[allow(clippy::unnecessary_cast)]
             // We need to drop its storage.
             self.arche_types
                 .get_mut(record.arche_type_id.0 as usize)
                 .expect("Arche type for entity does not exist.")
-                .component_storage
+                .component_table
                 .drop_row_and_content(record.row);
 
             // This entity existed, and was removed.
@@ -486,6 +551,8 @@ mod test {
         let drop_result = world.drop_entity(entity_id);
         assert!(drop_result);
 
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         // Let's verify the arche type graph.
         let arche_type = world
             .arche_types
@@ -500,6 +567,8 @@ mod test {
         );
         assert_eq!(arche_type.remove_component, HashMap::from([]));
 
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let arche_type = world.arche_types.get(ARCHE_TYPE_A.0 as usize).unwrap();
         assert_eq!(
             arche_type.add_component,
@@ -510,6 +579,8 @@ mod test {
             HashMap::from([(component_id_a, EMPTY_ARCHE_TYPE_ID)])
         );
 
+        // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
+        #[allow(clippy::unnecessary_cast)]
         let arche_type = world.arche_types.get(ARCHE_TYPE_B.0 as usize).unwrap();
         assert_eq!(
             arche_type.add_component,
