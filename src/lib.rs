@@ -1,4 +1,4 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 #![feature(get_many_mut)]
 
@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+// Produces an error if more than one bus width is selected.
 #[cfg(any(
     all(
         feature = "bus_width_ptr",
@@ -93,7 +94,7 @@ pub mod bus {
 
 mod storage;
 use storage::{
-    ColumnConstruction, ComponentSet, ComponentTable, ReduceArgument, RowIndex, StorageAccessor,
+    ColumnConstruction, ComponentAccessor, ComponentSet, ComponentTable, ReduceArgument, RowIndex,
 };
 use unique_type_id::{TypeId, UniqueTypeId};
 
@@ -139,6 +140,23 @@ impl ArcheType {
             add_component: HashMap::new(),
             remove_component: HashMap::new(),
         }
+    }
+
+    fn iter<'a, A>(&'a mut self) -> impl Iterator<Item = A::TUPLE>
+    where
+        A: ComponentAccessor<'a>,
+    {
+        self.component_table.iter::<A>()
+    }
+
+    fn contains_components(&self, components: impl Iterator<Item = ComponentId>) -> bool {
+        for component in components {
+            if !self.component_table.contains_component(component) {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -346,17 +364,17 @@ impl<'a> EntityAccess<'a> {
     {
         let arche_type = self.arche_type();
 
-        arche_type.component_table.contains_component::<T>()
+        arche_type.component_table.contains_component(T::id())
     }
 
     /// Get a mutable reference to the components of this entity.
-    pub fn access_components_mut<'b, A>(&'b mut self) -> A
+    pub fn access_components_mut<'b, A>(&mut self) -> Option<A::TUPLE>
     where
-        A: StorageAccessor<'b>,
+        A: ComponentAccessor<'b>,
     {
         let row = self.record.row;
 
-        self.arche_type_mut().component_table.access_row(row)
+        self.arche_type_mut().component_table.access_row::<A>(row)
     }
 }
 
@@ -392,16 +410,25 @@ impl Default for World {
 }
 
 impl World {
-    /// Get an entity ID. It needs to be unique and never been used before (just in case someone is holding a reference to the dead entity)
+    // TODO a function to drop all entities and resources could be useful for resetting the entity count, since a machine with a 8bit or 16bit entity references
+    // runs a significant risk of running out of entity IDs within the application's lifetime.
+
+    /// Get an entity ID. It is unique and has never been used in this world before.
     fn next_entity_id(&mut self) -> EntityId {
         let entity_id = self.next_entity_id;
-        self.next_entity_id += 1;
+        self.next_entity_id = self
+            .next_entity_id
+            .checked_add(1)
+            .expect("Out of entity IDs");
 
         EntityId(bus::NonZero::new(entity_id).expect("Next entity ID was zero."))
     }
 
     /// Create a new entity that doesn't have any components stored in it yet.
-    pub fn create_empty_entity(&mut self) -> EntityId {
+    pub fn create_entity<T>(&mut self, components: T) -> EntityId
+    where
+        T: ComponentSet + StorageInsert,
+    {
         let entity_id = self.next_entity_id();
         // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
         #[allow(clippy::unnecessary_cast)]
@@ -412,13 +439,21 @@ impl World {
 
         let row = arche_type.component_table.insert_row(());
 
-        self.entities.insert(
+        // Safety: Using `self.next_entity_id()` we made sure this ID should be unique.
+        let (_entity_id_reference, record) = self.entities.insert_unique_unchecked(
             entity_id,
             EntityRecord {
                 arche_type_id: EMPTY_ARCHE_TYPE_ID,
                 row,
             },
         );
+
+        let mut entity_access = EntityAccess {
+            record,
+            arche_types: &mut self.arche_types,
+            arche_type_lookup: &mut self.arche_type_lookup,
+        };
+        entity_access.insert_components(components);
 
         entity_id
     }
@@ -453,7 +488,7 @@ impl World {
                 .get_mut(record.arche_type_id.0 as usize)
                 .expect("Arche type for entity does not exist.")
                 .component_table
-                .drop_row_and_content(record.row);
+                .drop_row(record.row);
 
             // This entity existed, and was removed.
             true
@@ -462,19 +497,44 @@ impl World {
             false
         }
     }
+
+    pub fn iter_components<'a, A>(&'a mut self) -> impl Iterator<Item = A::TUPLE>
+    where
+        A: ComponentAccessor<'a> + ComponentSet,
+    {
+        self.arche_types
+            .iter_mut()
+            .filter(|arche_type| arche_type.contains_components(A::components()))
+            .flat_map(|arche_type| arche_type.iter::<A>())
+    }
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use unique_type_id_derive::UniqueTypeId;
 
     use super::*;
+
+    #[derive(Debug, UniqueTypeId)]
+    #[UniqueTypeIdFile = "testing_types.toml"]
+    #[UniqueTypeIdType = "bus::Width"]
+    pub struct A(i32);
+
+    #[derive(Debug, UniqueTypeId)]
+    #[UniqueTypeIdFile = "testing_types.toml"]
+    #[UniqueTypeIdType = "bus::Width"]
+    pub struct B(f32);
+
+    #[derive(Debug, UniqueTypeId)]
+    #[UniqueTypeIdFile = "testing_types.toml"]
+    #[UniqueTypeIdType = "bus::Width"]
+    pub struct C(Vec<u8>);
 
     #[test]
     fn create_entity() {
         let mut world = World::default();
 
-        let entity_id = world.create_empty_entity();
+        let entity_id = world.create_entity(());
         assert!(world.entity_exists(entity_id));
     }
 
@@ -482,24 +542,11 @@ mod test {
     fn insert_remove_components() {
         let mut world = World::default();
 
-        #[derive(UniqueTypeId)]
-        #[UniqueTypeIdFile = "testing_types.toml"]
-        #[UniqueTypeIdType = "bus::Width"]
-        struct A(i32);
-
-        #[derive(UniqueTypeId)]
-        #[UniqueTypeIdFile = "testing_types.toml"]
-        #[UniqueTypeIdType = "bus::Width"]
-        struct B(f32);
-
-        let component_id_a: ComponentId = A::id();
-        let component_id_b: ComponentId = B::id();
-
         const ARCHE_TYPE_A: ArcheTypeId = ArcheTypeId(1);
         const ARCHE_TYPE_B: ArcheTypeId = ArcheTypeId(3);
         const ARCHE_TYPE_AB: ArcheTypeId = ArcheTypeId(2);
 
-        let entity_id = world.create_empty_entity();
+        let entity_id = world.create_entity(());
 
         // Insert and remove a bunch of components. Make sure we keep our arche types right.
         let mut entity = world.access_entity(entity_id).unwrap();
@@ -540,7 +587,7 @@ mod test {
         assert!(entity.has_component::<B>());
         assert_eq!(entity.record.arche_type_id, ARCHE_TYPE_AB);
 
-        let (a, b) = entity.access_components_mut::<(&mut A, &mut B)>();
+        let (a, b) = entity.access_components_mut::<(A, B)>().unwrap();
         assert_eq!(a.0, 24);
         assert_eq!(b.0, 5.00);
 
@@ -560,10 +607,7 @@ mod test {
             .unwrap();
         assert_eq!(
             arche_type.add_component,
-            HashMap::from([
-                (component_id_a, ARCHE_TYPE_A),
-                (component_id_b, ARCHE_TYPE_B)
-            ])
+            HashMap::from([(A::id(), ARCHE_TYPE_A), (B::id(), ARCHE_TYPE_B)])
         );
         assert_eq!(arche_type.remove_component, HashMap::from([]));
 
@@ -572,11 +616,11 @@ mod test {
         let arche_type = world.arche_types.get(ARCHE_TYPE_A.0 as usize).unwrap();
         assert_eq!(
             arche_type.add_component,
-            HashMap::from([(component_id_b, ARCHE_TYPE_AB),])
+            HashMap::from([(B::id(), ARCHE_TYPE_AB),])
         );
         assert_eq!(
             arche_type.remove_component,
-            HashMap::from([(component_id_a, EMPTY_ARCHE_TYPE_ID)])
+            HashMap::from([(A::id(), EMPTY_ARCHE_TYPE_ID)])
         );
 
         // Clippy doesn't like casting a usize to a usize, but we have to have the cast for when we're using u16 or some other type as the bus width.
@@ -584,11 +628,11 @@ mod test {
         let arche_type = world.arche_types.get(ARCHE_TYPE_B.0 as usize).unwrap();
         assert_eq!(
             arche_type.add_component,
-            HashMap::from([(component_id_a, ARCHE_TYPE_AB),])
+            HashMap::from([(A::id(), ARCHE_TYPE_AB),])
         );
         assert_eq!(
             arche_type.remove_component,
-            HashMap::from([(component_id_b, EMPTY_ARCHE_TYPE_ID)])
+            HashMap::from([(B::id(), EMPTY_ARCHE_TYPE_ID)])
         );
     }
 
@@ -597,6 +641,84 @@ mod test {
         assert_eq!(
             core::mem::size_of::<ComponentId>(),
             core::mem::size_of::<bus::Width>()
+        );
+    }
+
+    #[test]
+    fn iteration() {
+        let mut world = World::default();
+
+        let _entities = [
+            world.create_entity((A(0),)),
+            world.create_entity((A(1),)),
+            world.create_entity((B(2.0),)),
+            world.create_entity((B(3.0),)),
+            world.create_entity((C(Vec::from(b"4")),)),
+            world.create_entity((C(Vec::from(b"5")),)),
+            world.create_entity((A(6), B(6.0))),
+            world.create_entity((A(7), B(7.0))),
+            world.create_entity((B(8.0), C(Vec::from(b"8")))),
+            world.create_entity((B(9.0), C(Vec::from(b"9")))),
+            world.create_entity((A(10), B(10.0), C(Vec::from(b"10")))),
+            world.create_entity((A(11), B(11.0), C(Vec::from(b"11")))),
+        ];
+
+        let mut components = world
+            .iter_components::<(A,)>()
+            .map(|(a,)| a.0)
+            .collect::<Vec<_>>();
+        components.sort();
+        assert_eq!(components, Vec::from([0, 1, 6, 7, 10, 11]));
+
+        let mut components = world
+            .iter_components::<(B,)>()
+            .map(|(b,)| b.0 as usize)
+            .collect::<Vec<_>>();
+        components.sort();
+        assert_eq!(components, Vec::from([2, 3, 6, 7, 8, 9, 10, 11]));
+
+        let mut components = world
+            .iter_components::<(C,)>()
+            .map(|(b,)| b.0.clone())
+            .collect::<Vec<_>>();
+        components.sort();
+        assert_eq!(
+            components,
+            Vec::from([
+                Vec::from(b"10"),
+                Vec::from(b"11"),
+                Vec::from(b"4"),
+                Vec::from(b"5"),
+                Vec::from(b"8"),
+                Vec::from(b"9"),
+            ])
+        );
+
+        let mut components = world
+            .iter_components::<(A, B)>()
+            .map(|(a, b)| (a.0, b.0 as i32))
+            .collect::<Vec<_>>();
+        components.sort();
+        assert_eq!(components, Vec::from([(6, 6), (7, 7), (10, 10), (11, 11)]));
+
+        let mut components = world
+            .iter_components::<(A, C)>()
+            .map(|(a, b)| (a.0, b.0.clone()))
+            .collect::<Vec<_>>();
+        components.sort();
+        assert_eq!(
+            components,
+            Vec::from([(10, Vec::from(b"10")), (11, Vec::from(b"11"))])
+        );
+
+        let mut components = world
+            .iter_components::<(A, B, C)>()
+            .map(|(a, b, c)| (a.0, b.0 as i32, c.0.clone()))
+            .collect::<Vec<_>>();
+        components.sort();
+        assert_eq!(
+            components,
+            Vec::from([(10, 10, Vec::from(b"10")), (11, 11, Vec::from(b"11"))])
         );
     }
 }

@@ -10,7 +10,6 @@ use core::{
 use alloc::alloc::handle_alloc_error;
 use hashbrown::{HashMap, HashSet};
 use uninit::out_ref::Out;
-use unique_type_id::UniqueTypeId;
 
 use super::{bus, ComponentId};
 
@@ -312,6 +311,14 @@ impl ComponentTable {
         }
     }
 
+    pub fn iter<'a, A>(&'a mut self) -> impl Iterator<Item = A::TUPLE>
+    where
+        A: ComponentAccessor<'a>,
+    {
+        let allocated_rows = self.allocated_rows;
+        (0..allocated_rows).filter_map(move |row| self.access_row::<A>(RowIndex(row as bus::Width)))
+    }
+
     pub fn insert_row<I>(&mut self, to_insert: I) -> RowIndex
     where
         I: StorageInsert,
@@ -430,7 +437,7 @@ impl ComponentTable {
         let new_row = unsafe { other.insert_row_raw(component_sources) };
 
         // Safety: We have not transferred out the components that this will be building from. This is taking ownership of them.
-        let removed_components = unsafe { T::build(self, row) };
+        let removed_components = unsafe { T::build(self, row) }.unwrap();
 
         self.drop_row(row);
 
@@ -439,7 +446,7 @@ impl ComponentTable {
 
     /// Verify that a row is contained in this table and initalized.
     fn is_row_safe(&self, row: RowIndex) -> bool {
-        row.0 < self.next_row.0 || !self.free_rows.contains(&row)
+        row.0 < self.next_row.0 && !self.free_rows.contains(&row)
     }
 
     /// Gives mutable access to the raw bytes of the components in this table.
@@ -447,7 +454,7 @@ impl ComponentTable {
         &mut self,
         row: RowIndex,
         components: [ComponentId; N],
-    ) -> [&mut [u8]; N] {
+    ) -> Option<[&mut [u8]; N]> {
         // Check that the row is in the allocated range and not freed.
         if self.is_row_safe(row) {
             let mut component_references_iter = components.iter();
@@ -459,20 +466,20 @@ impl ComponentTable {
             let columns = self.components.get_many_mut(component_references).expect("Requested component that does not exist in arche type or request contained duplicate component.");
             let mut columns = columns.into_iter();
 
-            core::array::from_fn(|_i| {
+            Some(core::array::from_fn(|_i| {
                 let column = columns.next().unwrap();
                 // Safety: We checked that the row is within the column and is initalized up above.
                 unsafe { column.access_element_mut(row) }
-            })
+            }))
         } else {
-            panic!("Row is not allocated.")
+            None
         }
     }
 
     /// Access the components of this table.
-    pub fn access_row<'a, A>(&'a mut self, row: RowIndex) -> A
+    pub fn access_row<'a, A>(&mut self, row: RowIndex) -> Option<A::TUPLE>
     where
-        A: StorageAccessor<'a>,
+        A: ComponentAccessor<'a>,
     {
         A::access(self, row)
     }
@@ -483,11 +490,8 @@ impl ComponentTable {
     }
 
     /// Return true if this table stores this component.
-    pub fn contains_component<T>(&self) -> bool
-    where
-        T: UniqueTypeId<bus::Width>,
-    {
-        self.components.contains_key(&T::id())
+    pub fn contains_component(&self, component_id: ComponentId) -> bool {
+        self.components.contains_key(&component_id)
     }
 
     /// Iterate over the raw bytes of the components in this table.
@@ -506,18 +510,6 @@ impl ComponentTable {
             panic!("Attempt to access invalid row.")
         }
     }
-
-    /// Drop the components stored in this row, freeing their memory.
-    pub fn drop_row_and_content(&mut self, row: RowIndex) {
-        if self.is_row_safe(row) {
-            for column in self.components.values_mut() {
-                // Safety: We have verified above that the row is valid and initalized.
-                unsafe { column.drop_row(row) };
-            }
-        }
-
-        self.drop_row(row);
-    }
 }
 
 impl Drop for ComponentTable {
@@ -533,5 +525,98 @@ impl Drop for ComponentTable {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use alloc::sync::Arc;
+    use unique_type_id::UniqueTypeId;
+
+    use super::*;
+
+    #[derive(Debug, UniqueTypeId)]
+    #[UniqueTypeIdFile = "testing_types.toml"]
+    #[UniqueTypeIdType = "bus::Width"]
+    pub struct DropDetector(Arc<AtomicBool>);
+
+    impl Drop for DropDetector {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // TODO test columns.
+    // TOOD test expand and reduce operations.
+
+    #[test]
+    fn table_manipulation() {
+        // Start by testing our drop detector.
+        let drop_marker = Arc::new(AtomicBool::new(false));
+        let drop_detector = DropDetector(drop_marker.clone());
+
+        assert!(!drop_marker.load(Ordering::SeqCst));
+
+        drop(drop_detector);
+
+        assert!(drop_marker.load(Ordering::SeqCst));
+
+        let mut table =
+            ComponentTable::empty_type().extend(<(DropDetector,)>::columns().next().unwrap());
+
+        // Verify initial state.
+        assert_eq!(table.next_row.0, 0);
+        assert_eq!(table.allocated_rows, 0);
+        assert_eq!(table.free_rows.len(), 0);
+        assert!(!table.is_row_safe(RowIndex(0)));
+        assert!(!table.is_row_safe(RowIndex(1)));
+        assert!(table.access_row::<(DropDetector,)>(RowIndex(0)).is_none());
+        assert!(table.access_row::<(DropDetector,)>(RowIndex(1)).is_none());
+
+        // Test allocation.
+        let drop_marker = Arc::new(AtomicBool::new(false));
+        let row = table.insert_row((DropDetector(drop_marker.clone()),));
+
+        assert_eq!(table.next_row.0, 1);
+        assert_eq!(table.allocated_rows, INITIAL_ROW_ALLOCATION);
+        assert_eq!(table.free_rows, HashSet::from([]));
+        assert!(table.is_row_safe(RowIndex(0)));
+        assert!(!table.is_row_safe(RowIndex(1)));
+        assert!(table.access_row::<(DropDetector,)>(RowIndex(0)).is_some());
+        assert!(table.access_row::<(DropDetector,)>(RowIndex(1)).is_none());
+        assert!(!drop_marker.load(Ordering::SeqCst));
+
+        // Test drop.
+        table.drop_row(row);
+        assert_eq!(table.next_row.0, 1);
+        assert_eq!(table.allocated_rows, INITIAL_ROW_ALLOCATION);
+        assert_eq!(table.free_rows, HashSet::from([RowIndex(0)]));
+        assert!(!table.is_row_safe(RowIndex(0)));
+        assert!(!table.is_row_safe(RowIndex(1)));
+        assert!(table.access_row::<(DropDetector,)>(RowIndex(0)).is_none());
+        assert!(table.access_row::<(DropDetector,)>(RowIndex(1)).is_none());
+        assert!(drop_marker.load(Ordering::SeqCst));
+
+        // Test reallocation.
+        let drop_markers = core::array::from_fn::<_, 5, _>(|_i| Arc::new(AtomicBool::new(false)));
+        let rows = core::array::from_fn::<_, 5, _>(|i| {
+            table.insert_row((DropDetector(drop_markers[i].clone()),))
+        });
+        assert_eq!(
+            rows,
+            [
+                RowIndex(0),
+                RowIndex(1),
+                RowIndex(2),
+                RowIndex(3),
+                RowIndex(4),
+            ]
+        );
+
+        assert_eq!(table.next_row.0, 5);
+        assert_eq!(table.allocated_rows, INITIAL_ROW_ALLOCATION * 2);
+        assert_eq!(table.free_rows, HashSet::from([]));
     }
 }

@@ -12,24 +12,27 @@ use super::{
 use fortuples::fortuples;
 
 /// Used to access componets of an entity.
-pub trait StorageAccessor<'a>: 'a {
-    fn access(storage: &'a mut ComponentTable, row: RowIndex) -> Self;
+pub trait ComponentAccessor<'a> {
+    type TUPLE: 'a;
+    fn access(storage: &mut ComponentTable, row: RowIndex) -> Option<Self::TUPLE>;
 }
 
 #[rustfmt::skip]
 fortuples! {
-    impl<'a> StorageAccessor<'a> for (#(&'a mut #Member),*)
+    impl<'a> ComponentAccessor<'a> for (#(#Member),*)
     where
         #(#Member: UniqueTypeId<bus::Width> + 'static),*
     {
+	type TUPLE = (#(&'a mut #Member),*);
+	
 	#[allow(clippy::unused_unit)]
-	fn access(storage: &'a mut ComponentTable, row: RowIndex) -> (#(&'a mut #Member),*) {
+	fn access(storage: &mut ComponentTable, row: RowIndex) -> Option<Self::TUPLE> {
             let components = [#(#Member::id()),*];
-            let [#(casey::lower!(#Member)),*] = storage.access_row_raw(row, components);
+            let [#(casey::lower!(#Member)),*] = storage.access_row_raw(row, components)?;
 
             #(let casey::lower!(#Member) = casey::lower!(#Member) as *mut _ as *mut #Member;)*
 	    
-            (#(unsafe { &mut *casey::lower!(#Member) }),*)
+            Some((#(unsafe { &mut *casey::lower!(#Member) }),*))
         }
     }
 }
@@ -71,11 +74,11 @@ fortuples! {
 }
 
 /// A set of components we intend to remove from storage.
-pub trait ReduceArgument {
+pub trait ReduceArgument: Sized {
     /// # Safety
     /// Components removed from the storage must not be dropped by the table.
     /// It is safe for the components, once built, to be dropped.
-    unsafe fn build(storage: &mut ComponentTable, row: RowIndex) -> Self;
+    unsafe fn build(storage: &mut ComponentTable, row: RowIndex) -> Option<Self>;
 }
 
 #[rustfmt::skip]
@@ -85,13 +88,13 @@ fortuples! {
         #(#Member: UniqueTypeId<bus::Width> + 'static),*
     {	
 	#[allow(clippy::unused_unit)]
-	unsafe fn build(storage: &mut ComponentTable, row: RowIndex) -> Self {
+	unsafe fn build(storage: &mut ComponentTable, row: RowIndex) -> Option<Self> {
             let components = [#(#Member::id()),*];
-            let [#(casey::lower!(#Member)),*] = storage.access_row_raw(row, components);
+            let [#(casey::lower!(#Member)),*] = storage.access_row_raw(row, components)?;
 	    
             #(let casey::lower!(#Member) = unsafe { any_from_bytes::<#Member>(casey::lower!(#Member)) };)*
 	    
-	    (#(casey::lower!(#Member)),*)
+	    Some((#(casey::lower!(#Member)),*))
 	}
     }
 }
