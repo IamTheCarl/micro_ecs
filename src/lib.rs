@@ -95,10 +95,12 @@ pub mod bus {
 mod storage;
 use storage::{
     ColumnConstruction, ComponentAccessor, ComponentSet, ComponentTable, ReduceArgument, RowIndex,
+    StorageInsert,
 };
-use unique_type_id::{TypeId, UniqueTypeId};
+mod schedule;
+pub use schedule::*;
 
-use self::storage::StorageInsert;
+use unique_type_id::{TypeId, UniqueTypeId};
 
 /// A reference to an entity stored in our world.
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
@@ -140,6 +142,10 @@ impl ArcheType {
             add_component: HashMap::new(),
             remove_component: HashMap::new(),
         }
+    }
+
+    fn iter_component_ids(&self) -> impl Iterator<Item = ComponentId> + '_ {
+        self.component_table.iter_component_ids()
     }
 
     fn iter<'a, A>(&'a mut self) -> impl Iterator<Item = A::TUPLE>

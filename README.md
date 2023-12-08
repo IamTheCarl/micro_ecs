@@ -36,15 +36,21 @@ Currently there's just the [examples directory](examples), which is just being u
 
 # Design Goals
 
+These are my current design goals. They may change with time as the project expands.
+
 * Must run on Game Boy Advance
-** Cannot have dependency on [AtmoicPtr](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html)
+  * Cannot have dependency on [AtmoicPtr](https://doc.rust-lang.org/std/sync/atomic/struct.AtomicPtr.html)
+  * I want it to run on other hardware too but I consider this the lowest common denominator.
 * Must run on PC
-** I may settle for just having it run in a web browser.
-** Just the ECS. You'll need a support library to replicate GBA functionality on PC. That will likely be another project.
+  * I may settle for just having it run in a web browser.
+  * Just the ECS. You'll need a support library for any kind of IO features.
+* Optional Parallelism
+  * While support for a parallel executor may be included, it is second priority to the sequential executor.
+  Embedded devices can rarely do true parallel execution, and when they do it's strangely different from how your desktop does it, so it's not a high priority here.
 
 ## Anti-design goals
 
 * This is not a game engine.
-** There will be no asset management or rendering pipeline provided.
-* Embedded hardware first
-** Very few embedded devices have multiple cores. Running concurrent systems is not a design goal.
+  * There will be no asset management or rendering pipeline provided. These are too platform specific.
+* Scripting Languages
+  * ECS is good for scripting languages but embedded devices typically don't have the capacity for them. This is a low priority at best.
